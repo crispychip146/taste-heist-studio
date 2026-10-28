@@ -97,7 +97,7 @@ test('SQLite survives restart, preserves hashed sessions and makes interrupted r
   assert.equal(store.db.prepare('SELECT count(*) AS total FROM rooms WHERE code=?').get('OLD12').total, 0);
   assert.equal(resumed.body.room.self.id, room.host); await app.close(); rmSync(dir, { recursive: true });
 });
-test('upstream errors and disjoint or empty results retain real recovery actions without inventing a shared fit', async () => {
+test('upstream errors and disjoint or empty results keep pass-it-on available without inventing Qloo support', async () => {
   for (const kind of ['error', 'empty', 'disjoint']) {
     const qloo = fakeQloo({ research: kind !== 'error' ? async players => players.map((p, i) => ({ playerId: p.id, entities: kind === 'empty' ? [] : [entity(500 + i)] })) : async () => { throw new ProviderError('QLOO_AUTH', 'Credential rejected.'); } });
     const store = new Store(':memory:'), app = createApp({ store, qloo });
@@ -113,8 +113,11 @@ test('upstream errors and disjoint or empty results retain real recovery actions
       }
       const view = (await request(app, '/api/session', undefined, cookies[0])).body.room;
       assert.equal(view.phase, kind === 'error' ? 'researching' : 'briefing');
-      assert(view.availableRoutes.every(route => !route.available));
-      assert.equal((await action(app, cookies[0], { type: 'route', route: 'mentor' })).status, 400);
+      if (kind === 'error') assert.equal((await action(app, cookies[1], { type: 'use-favorites' })).status, 200);
+      const ready = (await request(app, '/api/session', undefined, cookies[0])).body.room;
+      assert(ready.availableRoutes.find(route => route.route === 'mentor').available);
+      assert(!ready.availableRoutes.find(route => route.route === 'shared').available);
+      assert.equal((await action(app, cookies[0], { type: 'route', route: 'mentor' })).status, 200);
       await action(app, cookies[0], { type: 'retaste' });
       assert.equal(store.get(code).phase, 'intake');
       assert.equal(store.get(code).players.length, 2);
@@ -185,4 +188,45 @@ test('old divergent or exchange outcomes return to shared agreement while preser
       assert(recovered.players.every(player => !player.discoveryId && player.readyStage === null));
     } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
   }
+});
+
+test('fallback artwork, one-tap idempotence and canonical result survive an actual SQLite/app restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'heist-handoff-')), file = join(dir, 'crew.sqlite');
+  const qloo = () => fakeQloo({ research: async players => players.map(player => ({ playerId: player.id, entities: [] })) });
+  const artwork = () => new Artwork({ fetcher: async () => new Response(Buffer.from([255, 216, 255, 217]), { headers: { 'content-type': 'image/jpeg' } }) });
+  let app = createApp({ store: new Store(file), qloo: qloo(), artwork: artwork() });
+  try {
+    const { cookies, code } = await crew(app);
+    for (const [i, cookie] of cookies.entries()) {
+      const matches = await request(app, '/api/search', { query: i ? 'second' : 'first', type: 'movie' }, cookie);
+      await action(app, cookie, { type: 'favorites', ids: matches.body.matches.map(item => item.id) });
+    }
+    await app.research(code, app.store.get(code).generation);
+    assert.equal((await request(app, `/api/artwork/${id(1)}`, undefined, cookies[1])).status, 404, 'a friend’s private favourites are not available before route consent');
+    for (const cookie of cookies) await action(app, cookie, { type: 'route', route: 'mentor' });
+    assert.equal((await request(app, `/api/artwork/${id(1)}`, undefined, cookies[1])).status, 200, 'fallback cards have usable authenticated artwork');
+    const secret = app.store.get(code).secrets;
+    for (const cookie of cookies) await action(app, cookie, { type: 'solve', answer: secret.code });
+    for (const cookie of cookies) await action(app, cookie, { type: 'continue' });
+    const proposal = { type: 'choose-discovery', answer: id(1), commandId: randomUUID(), expectedPhase: 'playing', expectedStage: 1 };
+    assert.equal((await request(app, '/api/command', proposal, cookies[0])).status, 200);
+    await action(app, cookies[1], { type: 'choose-discovery', answer: id(2) });
+    assert.equal(app.store.get(code).stage, 1);
+    await app.close(); app = createApp({ store: new Store(file), qloo: qloo(), artwork: artwork() });
+    const restored = (await request(app, '/api/session', undefined, cookies[1])).body.room;
+    assert(restored.discoveryConflict); assert.equal(restored.self.readyForNext, true);
+    await action(app, cookies[1], { type: 'choose-discovery', answer: id(1), expectedStage: 1 });
+    assert.equal(app.store.get(code).stage, 2);
+    assert.equal((await request(app, '/api/command', proposal, cookies[0])).status, 200, 'a retried stage-one request replays without touching stage two');
+    assert.equal(app.store.get(code).stage, 2);
+    assert.equal((await action(app, cookies[1], { type: 'choose-discovery', answer: id(2), expectedStage: 1 })).status, 409);
+    for (const cookie of cookies) await action(app, cookie, { type: 'solve', answer: secret.exit });
+    for (const cookie of cookies) await action(app, cookie, { type: 'continue' });
+    await app.close(); app = createApp({ store: new Store(file), qloo: qloo(), artwork: artwork() });
+    const views = await Promise.all(cookies.map(cookie => request(app, '/api/session', undefined, cookie)));
+    assert(views.every(result => result.body.room.phase === 'debrief' && result.body.room.discovery.id === id(1)));
+    assert.deepEqual(views[0].body.room.evidence, views[1].body.room.evidence);
+    assert(views[0].body.room.evidence.every(person => !person.returned && !person.receipts.length));
+    assert.equal(views[0].body.room.discoveryConnection.basis, 'crew-favourite');
+  } finally { await app.close(); rmSync(dir, { recursive: true, force: true }); }
 });

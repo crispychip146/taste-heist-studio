@@ -1,7 +1,7 @@
 import { randomBytes, randomInt, createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
-import { createRoom, addPlayer, command, project, installResearch, GameError, publicEntity } from './game.mjs';
+import { createRoom, addPlayer, command, project, installResearch, eligible, GameError, publicEntity } from './game.mjs';
 import { Store } from './store.mjs';
 import { Qloo, isEntityId } from './qloo.mjs';
 import { ProviderError, providerFeedback } from './errors.mjs';
@@ -203,7 +203,8 @@ export function createApp({ store = new Store(), qloo = new Qloo(), artwork = ne
         const { room, session } = authenticate(request), self = room.players.find(p => p.id === session.player);
         limit(`artwork:${session.player}`, 80);
         const candidates = ['familiarity', 'briefing', 'playing', 'debrief'].includes(room.phase) ? room.candidates : [];
-        const entity = [...self.resolved, ...self.favorites, ...candidates].find(entity => entity.id === id);
+        const shared = ['playing', 'debrief'].includes(room.phase) ? [...eligible(room), ...(room.discovery ? [room.discovery] : [])] : [];
+        const entity = [...self.resolved, ...self.favorites, ...candidates, ...shared].find(entity => entity.id === id);
         if (!entity) return send(response, 404, { error: 'Artwork unavailable.' });
         const image = await artwork.get(entity.imageSource);
         response.writeHead(200, { 'content-type': image.type, 'content-length': image.body.length, 'cache-control': 'private, max-age=900' });

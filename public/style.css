@@ -2083,7 +2083,9 @@ input:focus,select:focus {
   border-top:1px solid var(--line);
   font-size:.95rem
 }
-.discovery-consensus li span { color:var(--muted); overflow-wrap:anywhere; }
+.discovery-consensus li strong { min-width:0; overflow-wrap:anywhere; }
+.discovery-consensus li span { flex:1 1 140px; min-width:0; color:var(--muted); overflow-wrap:anywhere; }
+.discovery-consensus li .button { max-width:100%; white-space:normal; }
 .discovery-choice>span {
   min-width:0
 }

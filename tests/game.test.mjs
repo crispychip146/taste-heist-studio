@@ -27,7 +27,8 @@ test('unknown, skipped and unsupported candidates cannot masquerade as new share
   room.players.forEach(p => { p.familiarity[id] = 'new'; }); assert(eligible(room, 'shared').some(e => e.id === id));
   room.players[0].familiarity[id] = 'skip'; assert(!eligible(room, 'shared').some(e => e.id === id));
   room.players[0].familiarity[id] = 'known'; assert(eligible(room, 'mentor').some(e => e.id === id));
-  room.players[1].support = []; assert.equal(eligible(room, 'mentor').length, 0);
+  room.players[1].support = []; assert(!eligible(room, 'mentor').some(entity => entity.id === id));
+  assert(eligible(room, 'mentor').every(entity => room.players.some(player => player.favorites.some(favorite => favorite.id === entity.id))));
 });
 test('projection does not leak private lists, familiarity, decoder, order or solution', () => {
   const room = launch(confirmed(4));
@@ -147,22 +148,22 @@ test('source receipts remain private until the debrief and expose only the selec
   assert.equal(view.evidence[0].receipts[0].entityId,room.candidates[0].id);assert(!JSON.stringify(view).includes('privateHeaders'));assert(!JSON.stringify(view).includes('never-expose'));
 });
 
-for (const mark of ['known', 'skip']) test(`all-${mark} recommendations cannot masquerade as either discovery route`, () => {
+for (const mark of ['known', 'skip']) test(`all-${mark} recommendations keep pass-it-on open without pretending they are new shared discoveries`, () => {
   const room = prepared();
   for (const player of room.players) {
     for (const item of room.candidates) command(room, player.id, { type: 'familiarity', id: item.id, value: mark });
     command(room, player.id, { type: 'confirm' });
   }
-  assert(project(room, 'p0').availableRoutes.every(route => !route.available));
+  assert(!project(room, 'p0').availableRoutes.find(route => route.route === 'shared').available);
+  assert(project(room, 'p0').availableRoutes.find(route => route.route === 'mentor').available);
   assert(project(room, 'p0').canRefine);
-  assert.throws(() => command(room, 'p0', { type: 'route', route: 'mentor' }), /another discovery/);
   const favorites = structuredClone(room.players.map(player => player.favorites));
   command(room, 'p0', { type: 'refine' });
   assert.equal(room.phase, 'researching');
   assert.deepEqual(room.players.map(player => player.favorites), favorites);
 });
 
-for (const count of [2, 3, 4]) test(`${count}-person pass-it-on can introduce one selected favourite only when Qloo supports every other profile`, () => {
+for (const count of [2, 3, 4]) test(`${count}-person pass-it-on prefers a known/new selected favourite with independent Qloo support`, () => {
   const room = prepared(count), favorite = room.players[0].favorites[0];
   room.phase = 'researching'; room.research = { status: 'working' };
   installResearch(room, room.players.map((player, i) => ({ playerId: player.id, entities: i ? [favorite] : [] })));
@@ -184,12 +185,13 @@ for (const count of [2, 3, 4]) test(`${count}-person pass-it-on can introduce on
   }
 });
 
-test('a friend’s favourite is not a fit for an unsupported profile or an all-familiar crew', () => {
+test('an unsupported favourite remains a voluntary crew choice and never becomes fake Qloo evidence', () => {
   const room = prepared(3), favorite = room.players[0].favorites[0];
   room.phase = 'researching'; room.research = {};
   installResearch(room, room.players.map((player, i) => ({ playerId: player.id, entities: i === 1 ? [favorite] : [] })));
   assert(!room.candidates.some(item => item.id === favorite.id));
-  assert(project(room, 'p0').availableRoutes.every(route => !route.available));
+  assert(eligible(room, 'mentor').some(item => item.id === favorite.id));
+  assert.equal(room.players[2].support.includes(favorite.id), false);
 });
 
 test('wider research preserves reviews, favourites, actual earlier memberships and source receipts', () => {
@@ -274,4 +276,68 @@ for (const count of [2, 3, 4]) for (const route of ['shared', 'mentor']) test(`$
     assert.equal(branch.stage, 2);
     assert.equal(branch.discovery.id, choice.id);
   }
+});
+
+for (const count of [2, 3, 4]) for (const scenario of ['empty', 'disjoint', 'all-known', 'all-skipped', 'identical-favourites']) {
+  test(`${count}-person ${scenario} research always reaches one shared pass-it-on result`, () => {
+    const room = prepared(count);
+    if (scenario === 'identical-favourites') {
+      for (const player of room.players) player.favorites = structuredClone(room.players[0].favorites);
+    }
+    room.phase = 'researching'; room.research = { status: 'working' };
+    installResearch(room, room.players.map((player, i) => ({ playerId: player.id,
+      entities: scenario === 'empty' || scenario === 'identical-favourites' ? [] : scenario === 'disjoint' ? [entity(1200 + i)] : [entity(1300), entity(1301)] })));
+    if (room.phase === 'familiarity') for (const player of room.players) {
+      for (const item of room.candidates) command(room, player.id, { type: 'familiarity', id: item.id, value: scenario === 'all-known' ? 'known' : scenario === 'all-skipped' ? 'skip' : 'new' });
+      command(room, player.id, { type: 'confirm' });
+    }
+    // Include the hardest cases: even every favourite familiar or previously skipped.
+    if (['all-known', 'all-skipped'].includes(scenario)) for (const player of room.players) {
+      for (const owner of room.players) for (const favorite of owner.favorites) player.familiarity[favorite.id] = scenario === 'all-known' ? 'known' : 'skip';
+    }
+    const rawSupport = room.players.map(player => [...player.support]);
+    for (const player of room.players) {
+      const view = project(room, player.id);
+      assert(view.availableRoutes.find(route => route.route === 'mentor').available);
+      assert(!view.availableRoutes.find(route => route.route === 'shared').available);
+      assert(!view.candidates.some(item => room.players.some(owner => owner.favorites.some(favorite => favorite.id === item.id))));
+    }
+    launch(room, 'mentor'); clearRoom(room, room.secrets.code);
+    const views = room.players.map(player => project(room, player.id));
+    const pool = views[0].candidates;
+    assert(pool.length >= 2);
+    assert(views.every(view => JSON.stringify(view.candidates) === JSON.stringify(pool)), 'every seat receives the exact same choice pool');
+    assert(pool.every(item => room.players.some(player => player.favorites.some(favorite => favorite.id === item.id))));
+    assert(pool.every(item => item.connection.unknown + item.connection.new + item.connection.known + item.connection.skipped === count));
+    if (scenario === 'all-known') assert(pool.every(item => item.connection.known === count && item.connection.new === 0));
+    if (scenario === 'all-skipped') assert(pool.every(item => item.connection.skipped === count && item.connection.new === 0));
+    assert.throws(() => command(room, 'p0', { type: 'choose-discovery', answer: entity(9999).id }), /discoveries shown/);
+    command(room, 'p0', { type: 'pause' });
+    assert.throws(() => command(room, 'p1', { type: 'choose-discovery', answer: pool[0].id }), /Resume/);
+    command(room, 'p0', { type: 'pause' });
+    command(room, 'p0', { type: 'choose-discovery', answer: pool[0].id });
+    assert.equal(room.stage, 1, 'a host cannot choose for the other seats');
+    for (const player of room.players.slice(1)) command(room, player.id, { type: 'choose-discovery', answer: pool[1].id });
+    assert.equal(room.stage, 1); assert(project(room, 'p0').discoveryConflict); assert.equal(room.discovery, null);
+    // Joining someone else’s choice is sufficient: no hidden quiz or second confirmation.
+    command(room, 'p0', { type: 'choose-discovery', answer: pool[1].id });
+    assert.equal(room.stage, 2); assert.equal(room.discovery.id, pool[1].id);
+    assert.deepEqual(room.players.map(player => player.support), rawSupport, 'consensus never manufactures provider membership');
+    clearRoom(room, room.secrets.exit);
+    const completed = room.players.map(player => project(room, player.id));
+    assert(completed.every(view => view.discovery.id === pool[1].id));
+    assert(completed.every(view => JSON.stringify(view.evidence) === JSON.stringify(completed[0].evidence)));
+    for (const player of room.players) assert.deepEqual(project(structuredClone(room), player.id).discovery, completed[0].discovery);
+    if (scenario === 'empty') assert(completed[0].evidence.every(person => !person.returned && person.receipts.length === 0));
+  });
+}
+
+test('a saved two-step proposal and a new one-tap choice agree on the same canonical discovery', () => {
+  const room = launch(confirmed()); clearRoom(room, room.secrets.code);
+  const pick = eligible(room)[0];
+  command(room, 'p0', { type: 'solve', answer: pick.id });
+  command(room, 'p1', { type: 'choose-discovery', answer: pick.id });
+  assert.equal(room.stage, 1, 'an older unconfirmed proposal still needs its owner’s confirmation');
+  command(room, 'p0', { type: 'continue' });
+  assert.equal(room.stage, 2); assert.equal(room.discovery.id, pick.id);
 });

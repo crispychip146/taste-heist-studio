@@ -55,6 +55,23 @@ export function installResearch(room, results, now = Date.now()) {
 }
 const selectedFavorite = (player, id) => player.favorites.some(entity => entity.id === id);
 const fits = (player, id) => player.support.includes(id) || selectedFavorite(player, id);
+const familiarityFor = (player, id) => player.familiarity[id] || (selectedFavorite(player, id) ? 'known' : 'unknown');
+function connectionFor(room, entity) {
+  const marks = room.players.map(player => familiarityFor(player, entity.id));
+  const supported = room.players.filter(player => fits(player, entity.id)).length;
+  return { total: room.players.length, supported, basis: supported === room.players.length ? 'group-match' : 'crew-favourite',
+    known: marks.filter(mark => mark === 'known').length, new: marks.filter(mark => mark === 'new').length,
+    skipped: marks.filter(mark => mark === 'skip').length, unknown: marks.filter(mark => !['known', 'new', 'skip'].includes(mark)).length };
+}
+function crewFavorites(room) {
+  // One common pool, with every seat represented. These are live-resolved favourites,
+  // not invented provider returns or a separate personal outcome for each player.
+  const entities = [...new Map(Array.from({ length: 4 }, (_, i) => room.players.flatMap(player => player.favorites[i] ? [player.favorites[i]] : [])).flat().map(entity => [entity.id, entity])).values()];
+  return entities.sort((a, b) => {
+    const left = connectionFor(room, a), right = connectionFor(room, b);
+    return left.skipped - right.skipped || right.new - left.new;
+  });
+}
 function tasteResults(room) {
   const seeds = new Set(room.players.flatMap(player => player.favorites.map(entity => entity.id)));
   // An owner’s favourite proves their own interest, never anyone else’s.
@@ -66,13 +83,32 @@ export function canRefine(room) {
   return !room.research?.expanded || tasteResults(room).some(result => result.entities.some(entity => room.players.some(player => !['known', 'new', 'skip'].includes(player.familiarity[entity.id]))));
 }
 export function eligible(room, route = room.route) {
-  return room.candidates.filter(entity => {
+  const matched = room.candidates.filter(entity => {
     if (!room.players.every(p => fits(p, entity.id))) return false;
     const marks = room.players.map(p => p.familiarity[entity.id]);
     if (route === 'shared') return marks.every(m => m === 'new') && room.players.every(player => !selectedFavorite(player, entity.id));
     if (route === 'mentor') return marks.includes('known') && marks.includes('new') && marks.every(m => ['known', 'new'].includes(m));
     return false;
   });
+  // Passing something on is a human invitation, not a required intersection of
+  // recommendation lists. Prefer verified known/new matches; otherwise let the
+  // whole crew agree on one real favourite. Familiarity stays explicit, including
+  // unknown, skipped or all-known cases, instead of manufacturing novelty.
+  return route === 'mentor' && !matched.length ? crewFavorites(room) : matched;
+}
+function advanceIfReady(room, now) {
+  if (!room.players.every(player => player.solvedStage === room.stage && player.readyStage === room.stage)) return;
+  if (room.stage === 1) {
+    if (new Set(room.players.map(player => player.discoveryId)).size !== 1) return;
+    const discovery = eligible(room).find(entity => entity.id === room.players[0].discoveryId);
+    requireThat(discovery, 'Choose one of the discoveries offered to your crew.');
+    room.discovery = discovery;
+  }
+  if (room.stage < 2) { room.stage++; room.players.forEach(player => { player.hints = 0; }); }
+  else {
+    requireThat(room.discovery && room.players.every(player => player.discoveryId === room.discovery.id), 'Your crew must agree on one discovery before the reveal.');
+    room.phase = 'debrief'; room.finishedAt = now; room.elapsed = now - room.startedAt;
+  }
 }
 // Upgrade the former individual-outcome flow without choosing a winner or losing tastes.
 export function upgradeOutcome(room) {
@@ -111,7 +147,7 @@ export function clueFor(room, playerId, stage = room.stage) {
   }
   if (stage === 1) {
     const player = room.players[index];
-    return { kind: 'connections', entities: eligible(room).map(e => ({ id: e.id, name: e.name, familiarity: player.familiarity[e.id] })), text: 'Every discovery here already fits your whole crew and chosen route. Your own familiarity is shown here. Choose what you want to experience together.' };
+    return { kind: 'connections', entities: eligible(room).map(e => ({ id: e.id, name: e.name, familiarity: familiarityFor(player, e.id) })), text: 'Choose one card together. You can join a crew member’s choice with one tap. Your familiarity stays personal until you share it.' };
   }
   if (room.secrets.exitClues) return structuredClone(room.secrets.exitClues[index]);
   return { kind: 'sequence', first: count === 4 && index === 3 ? room.secrets.exit[0] : null, pairs: room.secrets.exit.slice(0, 3).map((item, i) => [item, room.secrets.exit[i + 1]])
@@ -156,6 +192,13 @@ export function command(room, playerId, action, now = Date.now(), random = secur
     case 'retry':
       host(); phase('researching'); requireThat(room.research?.status === 'error', 'Research is still working.');
       room.generation++; room.players.forEach(person => { person.routeChoice = null; }); room.research = { status: 'working', expanded: room.research.expanded === true, at: now }; break;
+    case 'use-favorites':
+      phase('researching'); requireThat(['error', 'empty'].includes(room.research?.status), 'Wait for research to finish.');
+      requireThat(room.players.every(person => person.favorites.length >= 2), 'Everyone needs to bring their favourites first.');
+      room.generation++; room.phase = 'briefing';
+      room.players.forEach(person => { person.confirmed = true; person.routeChoice = null; });
+      room.notice = 'Research is unavailable. You can still pass on a real crew favourite. Everyone chooses the route and agrees on one pick.';
+      break;
     case 'refine':
       phase('briefing'); requireThat(room.players.every(person => person.confirmed), 'Wait for everyone to finish their cards.');
       requireThat(canRefine(room), 'You have reviewed this trail. Revisit your cards or adjust your favourites to search a different direction.');
@@ -209,6 +252,13 @@ export function command(room, playerId, action, now = Date.now(), random = secur
     case 'reconsider':
       phase('playing'); requireThat(room.stage === 1 && !room.pausedAt, 'Discovery proposals can only change in the common-ground room.');
       player.solvedStage = null; player.readyStage = null; player.discoveryId = null; break;
+    case 'choose-discovery':
+      phase('playing'); requireThat(room.stage === 1, 'Choose your discovery in Common Ground.');
+      requireThat(!room.pausedAt, 'Resume the heist first.');
+      requireThat(eligible(room).some(entity => entity.id === action.answer), 'Choose one of the discoveries shown in Common Ground.');
+      player.discoveryId = action.answer; player.solvedStage = 1; player.readyStage = 1;
+      advanceIfReady(room, now);
+      break;
     case 'solve': {
       phase('playing'); requireThat(!room.pausedAt, 'Resume the heist first.'); room.attempts++;
       requireThat(player.solvedStage !== room.stage, 'You have cleared this room. Ready up when you want to continue.');
@@ -231,18 +281,7 @@ export function command(room, playerId, action, now = Date.now(), random = secur
       phase('playing'); requireThat(!room.pausedAt, 'Resume the heist first.');
       requireThat(player.solvedStage === room.stage, 'Check your own answer before continuing.');
       player.readyStage = room.stage;
-      if (room.players.every(p => p.solvedStage === room.stage && p.readyStage === room.stage)) {
-        if (room.stage === 1) {
-          if (new Set(room.players.map(person => person.discoveryId)).size !== 1) break;
-          room.discovery = room.candidates.find(entity => entity.id === player.discoveryId);
-          requireThat(room.discovery && eligible(room).some(entity => entity.id === room.discovery.id), 'Agree on a discovery that fits your route.');
-        }
-        if (room.stage < 2) { room.stage++; room.players.forEach(p => { p.hints = 0; }); }
-        else {
-          requireThat(room.discovery && room.players.every(person => person.discoveryId === room.discovery.id), 'Your crew must agree on one discovery before the reveal.');
-          room.phase = 'debrief'; room.finishedAt = now; room.elapsed = now - room.startedAt;
-        }
-      }
+      advanceIfReady(room, now);
       break;
     default: throw new GameError('Unknown action.');
   }
@@ -251,7 +290,7 @@ export function command(room, playerId, action, now = Date.now(), random = secur
 }
 const HINTS = [
   ['One agent has the order. The others have the decoder.', 'Share every clue on the crew board.', 'Replace each ordered symbol with its digit.'],
-  ['Every card shown already fits your whole crew and chosen route.', 'Choose what you would like to watch, read or listen to together.', 'Everyone confirms the same discovery. If your proposals differ, talk it through and change a proposal.'],
+  ['Every card shown is available to choose. There is no wrong answer here.', 'Choose what you would like to watch, read or listen to together.', 'Tap “Choose this too” on a crew member’s pick. Once everyone chooses the same thing, the crew moves on.'],
   ['Read each arrow as “immediately before”.', 'Connect matching souvenirs into one chain.', 'Find the souvenir that never appears at the end of an arrow. It goes first.'],
 ];
 export function project(room, playerId, now = Date.now()) {
@@ -274,7 +313,7 @@ export function project(room, playerId, now = Date.now()) {
     host: room.host, stage: room.stage, route: room.route, createdAt: room.createdAt, signalLength: room.secrets?.order.length || 4,
     players: room.players.map(p => ({ id: p.id, name: p.name, avatar: p.avatar, ready: p.favorites.length >= 2, confirmed: p.confirmed, routeReady: !!p.routeChoice, cleared: room.phase === 'playing' && p.solvedStage === room.stage, readyForNext: room.phase === 'playing' && p.readyStage === room.stage })),
     self: { id: self.id, favorites: self.favorites.map(publicEntity), resolved: (self.resolved || []).map(publicEntity), draft: self.draft || [], familiarity: self.familiarity, confirmed: self.confirmed, routeChoice: self.routeChoice || null, solved: room.phase === 'playing' && self.solvedStage === room.stage, readyForNext: room.phase === 'playing' && self.readyStage === room.stage, clue: room.phase === 'playing' ? clueFor(room, playerId) : null },
-    candidates: ['familiarity', 'briefing', 'playing', 'debrief'].includes(room.phase) ? candidates.map(entity => ({ ...publicEntity(entity), ...(commonGround ? { connection: { total: room.players.length, known: room.players.filter(player => player.familiarity[entity.id] === 'known').length, new: room.players.filter(player => player.familiarity[entity.id] === 'new').length } } : {}) })) : [],
+    candidates: ['familiarity', 'briefing', 'playing', 'debrief'].includes(room.phase) ? candidates.map(entity => ({ ...publicEntity(entity), ...(commonGround ? { connection: connectionFor(room, entity) } : {}) })) : [],
     research,
     notice: room.notice || null, messages: room.messages,
     board: commonGround ? room.board.map(entry => entry.stage === 1 && entry.clue?.kind === 'connections' ? { ...entry, clue: { ...entry.clue, entities: entry.clue.entities.filter(entity => matchedIds.has(entity.id)) } } : entry) : room.board,
@@ -282,13 +321,14 @@ export function project(room, playerId, now = Date.now()) {
     allCardsConfirmed: room.players.every(p => p.confirmed),
     routeConflict: personalPhase === 'briefing' && room.players.every(p => p.routeChoice) && new Set(room.players.map(p => p.routeChoice)).size > 1,
     availableRoutes: personalPhase === 'briefing' ? ['shared', 'mentor'].map(route => ({ route, available: room.players.every(p => p.confirmed) && eligible(room, route).length > 0 })) : [],
-    proposals: room.phase === 'playing' && room.stage === 1 ? room.players.map(player => ({ playerId: player.id, entity: player.solvedStage === 1 ? publicEntity(room.candidates.find(entity => entity.id === player.discoveryId)) : null })) : [],
+    proposals: commonGround ? room.players.map(player => ({ playerId: player.id, entity: player.solvedStage === 1 ? publicEntity(candidates.find(entity => entity.id === player.discoveryId)) : null })) : [],
     discoveryConflict: room.phase === 'playing' && room.stage === 1 && room.players.every(player => player.solvedStage === 1) && new Set(room.players.map(player => player.discoveryId)).size > 1,
     paused: !!room.pausedAt, elapsed: room.phase === 'debrief' ? room.elapsed : room.startedAt ? (room.pausedAt || now) - room.startedAt : 0,
     hints: self.hints || 0, hint: room.phase === 'playing' ? hints[(self.hints || 0) - 1] : null,
     discovery: discovery ? publicEntity(discovery) : null,
+    discoveryConnection: discovery ? connectionFor(room, discovery) : null,
   };
-  if (discovery) view.evidence = room.players.map(p => ({ name: p.name, favorites: p.favorites.map(f => f.name), returned: p.support.includes(discovery.id) || (p.researchRequests || []).some(request => request.returnedIds?.includes(discovery.id)), familiarity: p.familiarity[discovery.id] || 'unknown', selectedFavorite: selectedFavorite(p, discovery.id),
+  if (discovery) view.evidence = room.players.map(p => ({ name: p.name, favorites: p.favorites.map(f => f.name), returned: p.support.includes(discovery.id) || (p.researchRequests || []).some(request => request.returnedIds?.includes(discovery.id)), familiarity: familiarityFor(p, discovery.id), selectedFavorite: selectedFavorite(p, discovery.id),
     receipts: (p.researchRequests || []).filter(request => request.returnedIds?.includes(discovery.id)).map(({ requestId, category, inputIds, limit, completedAt, status }) => ({ requestId, category, inputIds, limit, completedAt, status, entityId: discovery.id, source: 'qloo', basis: 'combined favourites' })) }));
   return view;
 }

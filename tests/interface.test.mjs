@@ -246,13 +246,11 @@ for (const route of ['shared', 'mentor']) test(`${route} interface resolves conf
     const [pick, other] = host.view().candidates;
     await host.click('pick-discovery', pick.id); await host.click('solve-discovery');
     await guest.click('pick-discovery', other.id); await guest.click('solve-discovery');
-    for (const ui of [host, guest]) await ui.click('continue');
     assert.equal(host.view().stage, 1); assert.equal(guest.view().stage, 1);
     assert.match(host.markup(), /Different discoveries on the table/);
     assert.match(guest.markup(), /Change my proposal/);
-    await guest.click('reconsider'); await guest.click('pick-discovery', pick.id); await guest.click('solve-discovery');
-    assert.equal(host.view().stage, 1, 'changing a proposal does not advance anyone automatically');
-    await guest.click('continue');
+    assert.match(guest.markup(), /Choose this too/);
+    await guest.click('solve-discovery', pick.id);
     assert.equal(host.view().stage, 2);
     const clues = [host.view().self.clue, guest.view().self.clue];
     const chain = permutations(['record', 'book', 'ticket', 'key']).find(order => exitMatches(order, clues));
@@ -268,7 +266,7 @@ for (const route of ['shared', 'mentor']) test(`${route} interface resolves conf
     assert.equal(host.view().discovery.id, pick.id); assert.equal(guest.view().discovery.id, pick.id);
     assert.deepEqual(host.view().evidence, guest.view().evidence);
     assert.match(host.markup(), /YOUR CREW’S DISCOVERY/);
-    if (route === 'mentor') assert.match(guest.markup(), /Known to some. New to others/);
+    if (route === 'mentor') assert.match(guest.markup(), /Known to 1 · New to 1/);
     const restored = await browser(env, { cookie: guest.cookie() });
     assert.match(restored.markup(), /Good taste/); await restored.click('resume');
     assert.equal(restored.view().discovery.id, pick.id);
@@ -276,7 +274,7 @@ for (const route of ['shared', 'mentor']) test(`${route} interface resolves conf
   } finally { await env.app.close(); }
 });
 
-test('provider failures and skipped recommendations retain recovery actions without substituting an unrelated result', async () => {
+test('provider failures and skipped recommendations retain a real crew-favourite route', async () => {
   for (const failed of [false, true]) {
     const env = environment(failed ? fakeQloo({ research: async () => { throw new ProviderError('QLOO_TIMEOUT', 'Research timed out. Your crew is saved.', { retryable: true }); } }) : fakeQloo());
     try {
@@ -296,7 +294,12 @@ test('provider failures and skipped recommendations retain recovery actions with
       }
       assert.match(host.markup(), failed ? /Check research again/ : /Find more discoveries/);
       assert.match(host.markup(), /Change my favourites/);
-      assert(!host.view().availableRoutes.some(route => route.available));
+      if (failed) {
+        assert.match(guest.markup(), /Pass on a crew favourite/);
+        await guest.click('use-favorites');
+      }
+      assert(host.view().availableRoutes.find(route => route.route === 'mentor').available);
+      assert(!host.view().availableRoutes.find(route => route.route === 'shared').available);
       await host.click('retaste'); assert.equal(host.view().phase, 'intake');
       assert.equal(guest.view().self.favorites.length, 2);
     } finally { await env.app.close(); }
@@ -334,7 +337,7 @@ test('wider search keeps reviews and favourites in the actual interface and retu
     for (const ui of [host, guest]) { await ui.click('familiar', 'new', { id: entity(987).id }); await ui.click('confirm'); }
     assert.equal(host.view().phase, 'briefing');
     assert(host.view().availableRoutes.find(route => route.route === 'shared').available);
-    assert(!host.view().availableRoutes.find(route => route.route === 'mentor').available);
+    assert(host.view().availableRoutes.find(route => route.route === 'mentor').available);
   } finally { await env.app.close(); }
 });
 
@@ -437,4 +440,82 @@ test('pre-paint theme selection and browser chrome agree for saved, system and b
     assert.equal(document.documentElement.dataset.theme, expectedTheme);
     assert.equal(color, expectedColor);
   }
+});
+
+for (const count of [2, 4]) for (const scenario of ['empty', 'disjoint', 'error']) test(`${count}-client ${scenario} research completes pass-it-on through one-tap crew agreement`, async () => {
+  const qloo = fakeQloo({ research: async players => {
+    if (scenario === 'error') throw new ProviderError('QLOO_TIMEOUT', 'Research interrupted.', { retryable: true });
+    return players.map((player, i) => ({ playerId: player.id, entities: scenario === 'empty' ? [] : [entity(1800 + i)] }));
+  } });
+  const env = environment(qloo);
+  try {
+    const players = [];
+    for (let i = 0; i < count; i++) {
+      const ui = await browser(env); players.push(ui);
+      await ui.click(i ? 'join' : 'create');
+      await ui.submit('crew-form', { name: `Agent ${i}`, ...(i ? { code: players[0].view().code } : {}) });
+    }
+    await players[0].click('begin');
+    for (const [i, ui] of players.entries()) {
+      ui.nodes.get('#search-query').value = i % 2 ? 'second' : 'first'; ui.nodes.get('#search-type').value = 'movie';
+      await ui.submit('search-form');
+      for (const item of ui.view().self.resolved) await ui.click('taste', item.id);
+      await ui.click('submit-tastes');
+    }
+    const code = players[0].view().code;
+    await env.app.research(code, env.app.store.get(code).generation);
+    if (scenario === 'error') {
+      assert.match(players[1].markup(), /Pass on a crew favourite/);
+      await players[1].click('use-favorites');
+    } else if (scenario === 'disjoint') for (const ui of players) {
+      for (const item of ui.view().candidates) await ui.click('familiar', 'new', { id: item.id });
+      await ui.click('confirm');
+    }
+    for (const ui of players) {
+      assert(ui.view().availableRoutes.find(route => route.route === 'mentor').available);
+      assert(!ui.view().availableRoutes.find(route => route.route === 'shared').available);
+      await ui.click('route', 'mentor');
+    }
+    const clues = players.map(ui => ui.view().self.clue);
+    const mapping = Object.fromEntries(clues.filter(clue => clue.kind === 'mapping').flatMap(clue => clue.pairs));
+    const codeAnswer = clues.find(clue => clue.kind === 'order').symbols.map(symbol => mapping[symbol]).join('');
+    for (const ui of players) { ui.nodes.get('#vault-code').value = codeAnswer; await ui.submit('code-form'); }
+    for (const ui of players) await ui.click('continue');
+    const [pick, other] = players[0].view().candidates;
+    for (const ui of players) {
+      assert.match(ui.markup(), /Brought by your crew/);
+      assert(!ui.markup().includes('Fits all'));
+      assert(!ui.markup().includes('New to everyone'));
+      assert.match(ui.markup(), /yet to check it out/);
+      assert.match(ui.markup(), /No puzzle to guess/);
+    }
+    for (const [i, ui] of players.entries()) {
+      await ui.click('pick-discovery', i === 1 ? other.id : pick.id); await ui.click('solve-discovery');
+      assert(!ui.markup().includes('Confirm my choice'), 'choosing already confirms; there is no redundant ready step');
+    }
+    assert(players.every(ui => ui.view().stage === 1));
+    assert.match(players[1].markup(), /Choose this too/);
+    await players[1].click('solve-discovery', pick.id);
+    assert(players.every(ui => ui.view().stage === 2));
+    const exit = permutations(['record', 'book', 'ticket', 'key']).find(order => exitMatches(order, players.map(ui => ui.view().self.clue)));
+    for (const ui of players) {
+      const current = ['record', 'book', 'ticket', 'key'];
+      for (let i = 0; i < current.length; i++) if (current[i] !== exit[i]) {
+        const j = current.indexOf(exit[i]); await ui.click('swap', i); await ui.click('swap', j); [current[i], current[j]] = [current[j], current[i]];
+      }
+      await ui.click('solve-exit');
+    }
+    for (const ui of players) await ui.click('continue');
+    for (const ui of players) {
+      assert.equal(ui.view().phase, 'debrief'); assert.equal(ui.view().discovery.id, pick.id);
+      assert.deepEqual(ui.view().evidence, players[0].view().evidence);
+      assert(ui.view().evidence.every(person => !person.returned && person.receipts.length === 0));
+      assert.match(ui.markup(), /Chose to explore a crew member’s favourite/);
+      assert(!ui.markup().includes('Included in their Qloo research'));
+      assert(!ui.markup().includes('Known to some. New to others.'));
+    }
+    const restored = await browser(env, { cookie: players[1].cookie() });
+    await restored.click('resume'); assert.equal(restored.view().discovery.id, pick.id);
+    assert.match(restored.markup(), /YOUR CREW’S DISCOVERY/);
+  } finally { await env.app.close(); }
 });

@@ -46,11 +46,10 @@ try {
   }
   pass('Four exact live entity resolutions');
   const research = await qloo.research(profiles);
-  if (!research.every(result => result.entities.length)) throw new ProviderError('CHECK_EMPTY', 'A profile returned no usable recommendations.');
+  if (research.length !== profiles.length || profiles.some(profile => research.filter(result => result.playerId === profile.id && Array.isArray(result.entities)).length !== 1)) throw new ProviderError('CHECK_PROFILES', 'Every profile must have its own live research response.');
   const seeds = new Set(profiles.flatMap(profile => profile.favorites.map(entity => entity.id)));
   const common = research[0].entities.filter(entity => !seeds.has(entity.id) && research.every(result => result.entities.some(item => item.id === entity.id)));
-  if (!common.length) throw new ProviderError('CHECK_NO_OVERLAP', 'These public check profiles produced no shared discovery. Change QLOO_VERIFY_SIGNALS before accepting the integration.');
-  pass('Independent per-profile recommendations and genuine overlap', { sharedCount: common.length });
+  pass('Independent per-profile live responses and measured overlap', { returnedCounts: research.map(result => result.entities.length), sharedCount: common.length });
   const pictured = [...profiles.flatMap(p => p.favorites), ...research.flatMap(r => r.entities)].find(entity => imagePathFor(entity));
   if (!pictured) throw new ProviderError('CHECK_NO_ART', 'No supported artwork URL was returned. Verify the live image metadata before accepting the card integration.');
   await new Artwork().get(pictured.imageSource); pass('Live artwork retrieval and image validation');
@@ -66,13 +65,15 @@ try {
   }
   const roomCode = host.body.room.code; let room = app.store.get(roomCode);
   await app.research(roomCode, room.generation); room = app.store.get(roomCode);
-  if (room.phase !== 'familiarity') throw new ProviderError('CHECK_ROOM', 'Live research did not produce a playable room.');
+  if (!['familiarity', 'briefing'].includes(room.phase)) throw new ProviderError('CHECK_ROOM', 'Live research did not produce a playable room.');
   // Explicit automation marks are test inputs, never represented as human familiarity evidence.
-  for (let i = 0; i < cookies.length; i++) {
+  if (room.phase === 'familiarity') for (let i = 0; i < cookies.length; i++) {
     for (const entity of room.candidates) await move(cookies[i], { type: 'familiarity', id: entity.id, value: profiles[i].favorites.some(favorite => favorite.id === entity.id) ? 'known' : 'new' });
     await move(cookies[i], { type: 'confirm' });
   }
-  for (const cookie of cookies) await move(cookie, { type: 'route', route: 'shared' });
+  const ready = (await api('/api/session', null, host.cookie)).body.room;
+  if (!ready.availableRoutes.find(route => route.route === 'mentor')?.available) throw new ProviderError('CHECK_ROUTE', 'Pass-it-on must remain available after completed research.');
+  for (const cookie of cookies) await move(cookie, { type: 'route', route: 'mentor' });
   const views = await Promise.all(cookies.map(cookie => api('/api/session', null, cookie)));
   if (views.some(view => view.body.room.secrets || view.body.room.players.some(player => player.support || player.favorites))) throw new ProviderError('CHECK_PRIVACY', 'A public room projection exposed private research.');
   const order = views[0].body.room.self.clue.symbols, mapping = Object.fromEntries(views[1].body.room.self.clue.pairs);
@@ -81,15 +82,17 @@ try {
     for (const cookie of cookies) await move(cookie, { type: 'continue' });
   };
   await clear(order.map(symbol => mapping[symbol]).join(''));
-  const match = room.candidates.find(entity => common.some(item => item.id === entity.id));
-  await clear(match.id);
+  const choices = await Promise.all(cookies.map(cookie => api('/api/session', null, cookie)));
+  const match = choices[0].body.room.candidates[0];
+  if (!match || choices.some(view => JSON.stringify(view.body.room.candidates) !== JSON.stringify(choices[0].body.room.candidates))) throw new ProviderError('CHECK_CHOICES', 'Every crew member must receive the same nonempty discovery pool.');
+  for (const cookie of cookies) await move(cookie, { type: 'choose-discovery', answer: match.id });
   const exits = await Promise.all(cookies.map(cookie => api('/api/session', null, cookie)));
   const pairs = exits.flatMap(view => view.body.room.self.clue.pairs), chain = [pairs.find(([a]) => !pairs.some(([, b]) => a === b))[0]];
   while (chain.length < 4) chain.push(pairs.find(([a]) => a === chain.at(-1))[1]);
   await clear(chain);
   const completed = await Promise.all(cookies.map(cookie => api('/api/session', null, cookie)));
   if (completed.some(view => view.body.room.phase !== 'debrief' || view.body.room.discovery?.id !== match.id)) throw new ProviderError('CHECK_COMPLETION', 'Every member must receive the same agreed discovery.');
-  pass('Two independent sessions, private clues, all three rooms and one agreed discovery in every restored debrief');
+  pass('Always-available pass-it-on, one-tap agreement and one discovery in every restored debrief');
   report.status = 'passed'; console.log('Live provider and in-memory server journey passed. Browser/WebSocket network verification is still separate.');
 } catch (error) {
   report.status = 'blocked'; report.error = { code: error instanceof ProviderError ? error.code : 'CHECK_ERROR', message: error instanceof ProviderError ? error.message : 'The check stopped unexpectedly. No raw error or credential was logged.' };
