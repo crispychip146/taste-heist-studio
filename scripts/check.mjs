@@ -12,7 +12,7 @@ for (const folder of ['public', 'server', 'shared', 'scripts', 'tests']) {
 }
 const html = await readFile('public/index.html', 'utf8');
 const css = await readFile('public/style.css', 'utf8');
-for (const [, resource] of [...html.matchAll(/(?:src|href)="(\/[^"#]+)"/g), ...css.matchAll(/url\('(\/[^']+)'\)/g)]) await access(`public${resource}`);
+for (const [, resource] of [...html.matchAll(/(?:src|href)="(\/[^"#]+)"/g), ...css.matchAll(/url\('(\/[^']+)'\)/g)]) await access(`public${resource.split(/[?#]/)[0]}`);
 const app = await readFile('public/app.mjs', 'utf8');
 assert(!/innerHTML\s*\+=/.test(app));
 assert(!/QLOO_API_KEY/.test(app));

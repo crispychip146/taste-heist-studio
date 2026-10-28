@@ -9,7 +9,7 @@ import { createApp } from '../server/app.mjs';
 import { Store } from '../server/store.mjs';
 import { ProviderError } from '../server/errors.mjs';
 import { Artwork } from '../server/artwork.mjs';
-import { fakeQloo, id, entity } from './fixtures.mjs';
+import { fakeQloo, id, entity, confirmed, launch, clearRoom } from './fixtures.mjs';
 
 export async function request(app, path, data, cookie, origin) {
   const req = Readable.from(data ? [JSON.stringify(data)] : []); req.url = path; req.method = data ? 'POST' : 'GET';
@@ -49,7 +49,9 @@ test('HTTP journey with controlled provider: identities, private clues, concurre
   const order = views[0].body.room.self.clue.symbols, map = Object.fromEntries(views[1].body.room.self.clue.pairs);
   for (const cookie of cookies) await action(app, cookie, { type: 'solve', answer: order.map(symbol => map[symbol]).join('') });
   for (const cookie of cookies) await action(app, cookie, { type: 'continue' });
-  for (const cookie of cookies) await action(app, cookie, { type: 'solve', answer: id(100) });
+  // A cooldown saved by the old guessing flow must never block a valid recommendation proposal.
+  for (const player of store.get(code).players) store.wrongGuess(player.id, code, 1, `old-discovery-${player.id}`, 'old-fingerprint', 'Old discovery guess');
+  for (const cookie of cookies) assert.equal((await action(app, cookie, { type: 'solve', answer: id(100) })).status, 200);
   for (const cookie of cookies) await action(app, cookie, { type: 'continue' });
   const exits = await Promise.all(cookies.map(cookie => request(app, '/api/session', undefined, cookie)));
   const pairs = exits.flatMap(view => view.body.room.self.clue.pairs), chain = [pairs.find(([a]) => !pairs.some(([, b]) => a === b))[0]];
@@ -95,14 +97,29 @@ test('SQLite survives restart, preserves hashed sessions and makes interrupted r
   assert.equal(store.db.prepare('SELECT count(*) AS total FROM rooms WHERE code=?').get('OLD12').total, 0);
   assert.equal(resumed.body.room.self.id, room.host); await app.close(); rmSync(dir, { recursive: true });
 });
-test('upstream errors preserve a crew; empty evidence offers retaste without invented discoveries', async () => {
-  for (const empty of [false, true]) {
-    const qloo = fakeQloo({ research: empty ? async players => players.map((p, i) => ({ playerId: p.id, entities: [entity(500 + i)] })) : async () => { throw new ProviderError('QLOO_AUTH', 'Credential rejected.'); } });
-    const store = new Store(':memory:'), app = createApp({ store, qloo }); const { code, cookies } = await crew(app);
-    for (const cookie of cookies) { await request(app, '/api/search', { query: 'first', type: 'movie' }, cookie); await action(app, cookie, { type: 'favorites', ids: [id(1), id(3)] }); }
-    await app.research(code, store.get(code).generation);
-    const failed = store.get(code); assert.equal(failed.research.status, empty ? 'empty' : 'error'); assert.equal(failed.candidates.length, 0);
-    await action(app, cookies[0], { type: 'retaste' }); assert.equal(store.get(code).phase, 'intake'); assert.equal(store.get(code).players.length, 2); await app.close();
+test('upstream errors and disjoint or empty results retain real recovery actions without inventing a shared fit', async () => {
+  for (const kind of ['error', 'empty', 'disjoint']) {
+    const qloo = fakeQloo({ research: kind !== 'error' ? async players => players.map((p, i) => ({ playerId: p.id, entities: kind === 'empty' ? [] : [entity(500 + i)] })) : async () => { throw new ProviderError('QLOO_AUTH', 'Credential rejected.'); } });
+    const store = new Store(':memory:'), app = createApp({ store, qloo });
+    try {
+      const { code, cookies } = await crew(app);
+      for (const cookie of cookies) { await request(app, '/api/search', { query: 'first', type: 'movie' }, cookie); await action(app, cookie, { type: 'favorites', ids: [id(1), id(3)] }); }
+      await app.research(code, store.get(code).generation);
+      const room = store.get(code);
+      assert.equal(room.research.status, kind === 'error' ? 'error' : 'complete');
+      if (kind === 'disjoint') for (const cookie of cookies) {
+        for (const candidate of room.candidates) await action(app, cookie, { type: 'familiarity', id: candidate.id, value: 'new' });
+        await action(app, cookie, { type: 'confirm' });
+      }
+      const view = (await request(app, '/api/session', undefined, cookies[0])).body.room;
+      assert.equal(view.phase, kind === 'error' ? 'researching' : 'briefing');
+      assert(view.availableRoutes.every(route => !route.available));
+      assert.equal((await action(app, cookies[0], { type: 'route', route: 'mentor' })).status, 400);
+      await action(app, cookies[0], { type: 'retaste' });
+      assert.equal(store.get(code).phase, 'intake');
+      assert.equal(store.get(code).players.length, 2);
+      assert.equal(store.get(code).players[1].favorites.length, 2);
+    } finally { await app.close(); }
   }
 });
 test('draft selections and resolved metadata survive refresh; configuration is not mistaken for live verification', async () => {
@@ -125,4 +142,47 @@ test('artwork HTTP route returns private image bytes only for an authenticated p
   assert.equal((await request(app, `/api/artwork/${id(1)}`, undefined, cookies[1])).status, 404);
   assert.equal((await request(app, `/api/artwork/${id(1)}`)).status, 400);
   await app.close();
+});
+
+test('one canonical discovery and all evidence survive a database restart for every member', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'heist-outcome-')), file = join(dir, 'crew.sqlite');
+  let store = new Store(file);
+  try {
+    const room = launch(confirmed(4));
+    clearRoom(room, room.secrets.code); const choice = room.candidates[0].id;
+    clearRoom(room, choice); clearRoom(room, room.secrets.exit);
+    store.save(room);
+    const tokens = room.players.map((player, i) => { const token = String(i + 1).repeat(64); store.putSession(token, room.code, player.id); return token; });
+    store.close(); store = new Store(file);
+    const app = createApp({ store, qloo: fakeQloo() });
+    try {
+      const views = await Promise.all(tokens.map(token => request(app, '/api/session', undefined, `th_session=${token}`)));
+      assert(views.every(result => result.body.room.phase === 'debrief' && result.body.room.discovery.id === choice));
+      assert(views.every(result => JSON.stringify(result.body.room.evidence) === JSON.stringify(views[0].body.room.evidence)));
+    } finally { await app.close(); }
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('old divergent or exchange outcomes return to shared agreement while preserving profiles and sessions', () => {
+  for (const phase of ['playing', 'debrief']) {
+    const dir = mkdtempSync(join(tmpdir(), 'heist-upgrade-')), file = join(dir, 'crew.sqlite');
+    let store = new Store(file);
+    try {
+      const room = launch(confirmed()); clearRoom(room, room.secrets.code);
+      const favorites = structuredClone(room.players.map(player => player.favorites));
+      room.phase = phase; room.stage = 2; room.discovery = null;
+      room.players.forEach((player, i) => { player.discoveryId = room.candidates[i].id; player.solvedStage = 2; player.readyStage = 2; });
+      room.exchangeVersion = 1; delete room.outcomeVersion;
+      store.save(room); store.putSession('legacy-session', room.code, room.host);
+      store.close(); store = new Store(file);
+      const recovered = store.get(room.code);
+      assert(['briefing', 'familiarity'].includes(recovered.phase));
+      assert.equal(recovered.discovery, null);
+      assert.equal(recovered.outcomeVersion, 1);
+      assert.equal(recovered.exchangeVersion, undefined);
+      assert.deepEqual(recovered.players.map(player => player.favorites), favorites);
+      assert.equal(store.session('legacy-session').player, room.host);
+      assert(recovered.players.every(player => !player.discoveryId && player.readyStage === null));
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+  }
 });

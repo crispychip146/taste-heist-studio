@@ -3,6 +3,8 @@
 !.dockerignore
 !package.json
 !package-lock.json
+!LICENSE
+!THIRD_PARTY_NOTICES.md
 !server/
 !server/**
 !shared/

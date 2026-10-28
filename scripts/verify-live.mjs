@@ -47,7 +47,8 @@ try {
   pass('Four exact live entity resolutions');
   const research = await qloo.research(profiles);
   if (!research.every(result => result.entities.length)) throw new ProviderError('CHECK_EMPTY', 'A profile returned no usable recommendations.');
-  const common = research[0].entities.filter(entity => research.every(result => result.entities.some(item => item.id === entity.id)));
+  const seeds = new Set(profiles.flatMap(profile => profile.favorites.map(entity => entity.id)));
+  const common = research[0].entities.filter(entity => !seeds.has(entity.id) && research.every(result => result.entities.some(item => item.id === entity.id)));
   if (!common.length) throw new ProviderError('CHECK_NO_OVERLAP', 'These public check profiles produced no shared discovery. Change QLOO_VERIFY_SIGNALS before accepting the integration.');
   pass('Independent per-profile recommendations and genuine overlap', { sharedCount: common.length });
   const pictured = [...profiles.flatMap(p => p.favorites), ...research.flatMap(r => r.entities)].find(entity => imagePathFor(entity));
@@ -68,7 +69,7 @@ try {
   if (room.phase !== 'familiarity') throw new ProviderError('CHECK_ROOM', 'Live research did not produce a playable room.');
   // Explicit automation marks are test inputs, never represented as human familiarity evidence.
   for (let i = 0; i < cookies.length; i++) {
-    for (const entity of room.candidates) await move(cookies[i], { type: 'familiarity', id: entity.id, value: 'new' });
+    for (const entity of room.candidates) await move(cookies[i], { type: 'familiarity', id: entity.id, value: profiles[i].favorites.some(favorite => favorite.id === entity.id) ? 'known' : 'new' });
     await move(cookies[i], { type: 'confirm' });
   }
   for (const cookie of cookies) await move(cookie, { type: 'route', route: 'shared' });
@@ -86,12 +87,15 @@ try {
   const pairs = exits.flatMap(view => view.body.room.self.clue.pairs), chain = [pairs.find(([a]) => !pairs.some(([, b]) => a === b))[0]];
   while (chain.length < 4) chain.push(pairs.find(([a]) => a === chain.at(-1))[1]);
   await clear(chain);
-  if ((await api('/api/session', null, guest.cookie)).body.room.phase !== 'debrief') throw new ProviderError('CHECK_COMPLETION', 'The guest did not receive the completed heist.');
-  pass('Two independent sessions, private clues, all three rooms and restored debrief');
+  const completed = await Promise.all(cookies.map(cookie => api('/api/session', null, cookie)));
+  if (completed.some(view => view.body.room.phase !== 'debrief' || view.body.room.discovery?.id !== match.id)) throw new ProviderError('CHECK_COMPLETION', 'Every member must receive the same agreed discovery.');
+  pass('Two independent sessions, private clues, all three rooms and one agreed discovery in every restored debrief');
   report.status = 'passed'; console.log('Live provider and in-memory server journey passed. Browser/WebSocket network verification is still separate.');
 } catch (error) {
   report.status = 'blocked'; report.error = { code: error instanceof ProviderError ? error.code : 'CHECK_ERROR', message: error instanceof ProviderError ? error.message : 'The check stopped unexpectedly. No raw error or credential was logged.' };
+  if (error instanceof ProviderError && error.transportCode !== undefined) report.error.transportCode = error.transportCode;
   console.error(`${report.error.code}: ${report.error.message}`); process.exitCode = 1;
+  if (report.error.transportCode !== undefined) console.error(`Transport status: ${report.error.transportCode}`);
 } finally {
   if (app) await app.close(); else await qloo.close();
   await mkdir('data', { recursive: true }); await writeFile('data/live-verification.json', JSON.stringify(report, null, 2), { mode: 0o600 });

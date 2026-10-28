@@ -36,10 +36,10 @@ test('all workflow statuses are handled; raw provider messages cannot leak crede
   assert.throws(()=>workflowEntities({status:'error',summary:'test-secret-only',error:{code:'QLOO_AUTH',retryable:false,recovery:'test-secret-only'}}),error=>error.code==='QLOO_AUTH'&&!error.message.includes('test-secret-only')&&!error.retryable);
   assert.throws(()=>workflowEntities({status:'mystery',results:[]}),error=>error.code==='QLOO_CONTRACT');
 });
-test('independent research excludes every crew favourite and coalesces reusable requests',async()=>{
+test('independent research retains genuine cross-profile favourite returns and coalesces reusable requests',async()=>{
   const h=harness(async(name,args)=>({status:'ok',results:[record(1,args.target_type),record(100,args.target_type)]})),qloo=new Qloo({harness:h});const progress=[];
   const results=await qloo.research(profiles,event=>progress.push(event));
-  assert.equal(h.calls.length,6);assert(results.every(result=>result.entities.every(item=>item.id!==id(1))));
+  assert.equal(h.calls.length,6);assert(results.every(result=>result.entities.some(item=>item.id===id(1))));
   assert.equal(h.calls[0].args.signals.includes('local-a'),false);assert.equal(progress.at(-1).completed,6);
   await qloo.research(profiles);assert.equal(h.calls.length,6);assert(qloo.status().verifiedAt);await qloo.close();
 });
@@ -84,4 +84,75 @@ test('agent tool uses the same service and keeps novelty as a human decision',as
   const qloo=new Qloo({harness:harness()});const result=await researchCrew({profiles:profiles.map(p=>({id:p.id,entityIds:p.favorites.map(entity=>entity.id)}))},qloo);
   assert.equal(result.sharedCandidates[0].id,id(100));assert.match(result.nextAction,/human|person/);assert(!JSON.stringify(result).includes('test-secret-only'));
   assert.equal((await rpc({method:'tools/list'})).tools[0].name,'research_taste_crew');await qloo.close();
+});
+
+test('recommendation receipts preserve actual query context, source time and cache provenance',async()=>{
+  let now=123456;const h=harness(async(name,args)=>({status:'ok',results:[record(100,args.target_type)]}));
+  const qloo=new Qloo({harness:h,now:()=>now});try{
+    const first=await qloo.research(profiles);const receipt=first[0].requests[0];
+    assert.equal(receipt.status,'ok');assert.equal(receipt.completedAt,123456);assert.equal(receipt.limit,12);
+    assert.deepEqual(receipt.inputIds,profiles[0].favorites.map(item=>item.id));assert.match(receipt.requestId,/^[a-f0-9]{64}$/);
+    now+=1000;const cached=await qloo.research(profiles);assert.deepEqual(cached[0].requests[0],receipt);
+  }finally{await qloo.close();}
+});
+
+test('workflow timeouts are bounded, redacted and reconnect only on the next explicit call',async()=>{
+  let factories=0,closed=0,calls=0;const deadlines=[];
+  const makeClient=()=>({listTools:async()=>({tools:[recommendationTool,{name:'qloo_capabilities'}]}),
+    callTool:async(request,schema,options)=>{
+      if(request.name==='qloo_capabilities')return{structuredContent:{adapter:{ready:true}}};
+      calls++;deadlines.push(options);
+      if(factories===1)throw Object.assign(new Error('test-secret-only'),{code:-32001});
+      return{structuredContent:{status:'ok',results:[]}};
+    },close:async()=>{closed++;}});
+  const h=new Harness({env:{QLOO_API_KEY:'test-secret-only'},clientFactory:async()=>{factories++;return makeClient();}});
+  try{
+    await assert.rejects(h.call('qloo_recommend',{}),error=>error.code==='QLOO_TIMEOUT'&&error.transportCode===-32001&&!error.message.includes('test-secret-only'));
+    assert.equal(calls,1);assert.equal(factories,1);assert.equal(closed,1);assert.equal(h.client,null);assert.equal(h.credentialReady,false);
+    assert.equal((await h.call('qloo_recommend',{})).status,'ok');assert.equal(factories,2);assert.equal(calls,2);
+    assert(deadlines.every(options=>options.timeout===60000&&options.maxTotalTimeout===60000));
+  }finally{await h.close();}
+  assert.throws(()=>new Harness({env:{QLOO_WORKFLOW_TIMEOUT_MS:'Infinity'}}));
+  assert.throws(()=>new Harness({env:{QLOO_WORKFLOW_TIMEOUT_MS:'120001'}}));
+});
+
+test('a stale failed MCP call cannot close the replacement connection',async()=>{
+  let factories=0,rejectSlow,newClosed=0;
+  const tools=async()=>({tools:[recommendationTool,{name:'qloo_capabilities'}]});
+  const old={listTools:tools,callTool:async request=>{
+    if(request.name==='qloo_capabilities')return{structuredContent:{adapter:{ready:true}}};
+    if(request.arguments.slow)return new Promise((resolve,reject)=>{rejectSlow=reject;});
+    throw Object.assign(new Error('test-secret-only'),{code:-32000});
+  },close:async()=>{}};
+  const fresh={listTools:tools,callTool:async request=>({structuredContent:request.name==='qloo_capabilities'?{adapter:{ready:true}}:{status:'ok',results:[]}}),close:async()=>{newClosed++;}};
+  const h=new Harness({env:{QLOO_API_KEY:'test-secret-only'},clientFactory:async()=>++factories===1?old:fresh});
+  try{
+    const first=h.call('qloo_recommend',{});
+    const slow=assert.rejects(h.call('qloo_recommend',{slow:true}),error=>error.code==='QLOO_CONNECTION_CLOSED');
+    await assert.rejects(first,error=>error.code==='QLOO_CONNECTION_CLOSED');
+    assert.equal((await h.call('qloo_recommend',{})).status,'ok');
+    rejectSlow(Object.assign(new Error('test-secret-only'),{code:-32000}));await slow;
+    assert.equal(h.client,fresh);assert.equal(newClosed,0);assert.equal(factories,2);
+  }finally{await h.close();}
+});
+
+test('malformed tool envelopes remain contract errors and do not cause connection retries',async()=>{
+  let closed=0;
+  const client={listTools:async()=>({tools:[recommendationTool,{name:'qloo_capabilities'}]}),callTool:async request=>request.name==='qloo_capabilities'?{structuredContent:{adapter:{ready:true}}}:{content:[{type:'text',text:'test-secret-only'}]},close:async()=>{closed++;}};
+  const h=new Harness({env:{QLOO_API_KEY:'test-secret-only'},clientFactory:async()=>client});
+  try{await assert.rejects(h.call('qloo_recommend',{}),error=>error.code==='QLOO_CONTRACT'&&!error.message.includes('test-secret-only'));assert.equal(closed,0);assert.equal(h.client,client);}
+  finally{await h.close();}
+});
+
+test('explicit wider search requests the larger limit once per profile/category and reuses its evidence cache', async () => {
+  const h = harness(async (name, args) => ({ status: 'ok', results: [record(args.signals[0] === id(1) ? 101 : 102, args.target_type)] }));
+  const qloo = new Qloo({ harness: h });
+  try {
+    const first = await qloo.research(profiles, () => {}, { expanded: true });
+    assert.equal(h.calls.length, 6);
+    assert(h.calls.every(call => call.args.limit === 20));
+    assert(first.every(result => result.requests.every(receipt => receipt.limit === 20)));
+    await qloo.research(profiles, () => {}, { expanded: true });
+    assert.equal(h.calls.length, 6, 'reviewing a cached wider trail must not trigger duplicate provider requests');
+  } finally { await qloo.close(); }
 });

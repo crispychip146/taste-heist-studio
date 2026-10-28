@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { Harness, workflowEntities } from './harness.mjs';
 import { ProviderError } from './errors.mjs';
 import { shortlist } from './shortlist.mjs';
+import { setting, positiveInteger } from './limits.mjs';
 
 export const TYPES = ['movie', 'book', 'artist'];
 export const isEntityId = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
@@ -89,32 +90,45 @@ export function normalizeEntity(record, expectedType) {
   };
 }
 export class Qloo {
-  constructor({ harness = new Harness(), maxRequests = Number(process.env.QLOO_RESEARCH_BUDGET || 24), now = Date.now } = {}) {
-    this.harness = harness; this.maxRequests = Math.max(12, Math.min(36, maxRequests || 24)); this.now = now;
+  constructor({ harness = new Harness(), maxRequests = process.env.QLOO_RESEARCH_BUDGET ?? 24, now = Date.now, reserve = () => {}, outcome = () => {}, queueLimit = setting('QLOO_QUEUE_LIMIT', 24, 200) } = {}) {
+    this.harness = harness; this.maxRequests = positiveInteger(maxRequests, 'QLOO_RESEARCH_BUDGET', 36); this.now = now; this.reserve = reserve; this.outcome = outcome;
+    this.queueLimit = positiveInteger(queueLimit, 'QLOO_QUEUE_LIMIT', 200);
+    this.minuteLimit = setting('QLOO_REQUESTS_PER_MINUTE', 30);
+    for (const name of ['QLOO_DAILY_BUDGET', 'QLOO_ROOM_DAILY_BUDGET', 'QLOO_PLAYER_DAILY_BUDGET']) setting(name, name === 'QLOO_DAILY_BUDGET' ? 1000 : 120);
     this.cache = new Map(); this.inflight = new Map(); this.waiters = []; this.active = 0; this.requestTimes = []; this.lastVerifiedAt = null;
   }
   status() { return { configured: !!this.harness.env?.QLOO_API_KEY, harnessReady: this.harness.credentialReady, verifiedAt: this.lastVerifiedAt }; }
-  async limited(task) {
-    if (this.active >= 2) await new Promise(resolve => this.waiters.push(resolve));
+  async limited(task, scope) {
+    if (this.closed) throw new ProviderError('QLOO_CLOSED', 'Research is stopping. Reconnect to the archive.');
+    if (this.active >= 2) {
+      if (this.waiters.length >= this.queueLimit) throw new ProviderError('QLOO_BUSY', 'Research is busy. Your crew is saved; try again shortly.', { status: 503, retryable: true, retryAfter: 5 });
+      await new Promise(resolve => this.waiters.push(resolve));
+    }
     else this.active++;
+    let dispatched = false;
     try {
       if (this.closed) throw new ProviderError('QLOO_CLOSED', 'Research is stopping. Reconnect to the archive.');
       this.requestTimes = this.requestTimes.filter(time => time > this.now() - 60000);
-      if (this.requestTimes.length >= Number(process.env.QLOO_REQUESTS_PER_MINUTE || 30)) throw new ProviderError('QLOO_LOCAL_RATE', 'The server is spacing out Qloo requests. Wait a minute before retrying.', { retryable: true });
-      this.requestTimes.push(this.now()); return await task();
+      if (this.requestTimes.length >= this.minuteLimit) throw new ProviderError('QLOO_LOCAL_RATE', 'The server is spacing out Qloo requests. Wait a minute before retrying.', { retryable: true, status: 429, retryAfter: 60 });
+      this.requestTimes.push(this.now());
+      await this.reserve(scope); dispatched = true;
+      const value = await task(); await this.outcome(true); return value;
+    } catch (error) {
+      if (dispatched && /^(QLOO_AUTH|QLOO_TIMEOUT|QLOO_TRANSPORT|QLOO_CONNECTION_CLOSED|QLOO_UPSTREAM|QLOO_SEARCH|QLOO_METADATA|QLOO_INCOMPLETE|QLOO_CONTRACT|QLOO_RATE)/.test(error.code || '')) await this.outcome(false);
+      throw error;
     } finally { const next = this.waiters.shift(); if (next) next(); else this.active--; }
   }
-  async cached(key, task) {
+  async cached(key, task, scope) {
     const previous = this.cache.get(key);
     if (previous && previous.expires > this.now()) return structuredClone(previous.value);
     if (this.inflight.has(key)) return structuredClone(await this.inflight.get(key));
-    const pending = this.limited(task).then(value => {
+    const pending = this.limited(task, scope).then(value => {
       if (this.cache.size >= 200) this.cache.delete(this.cache.keys().next().value);
       this.cache.set(key, { value, expires: this.now() + 5 * 60000 }); return value;
     }).finally(() => this.inflight.delete(key));
     this.inflight.set(key, pending); return structuredClone(await pending);
   }
-  async search(query, type) {
+  async search(query, type, scope) {
     if (!TYPES.includes(type) || typeof query !== 'string' || query.trim().length < 2 || query.length > 100 || /[\x00-\x1f]/.test(query) || query.trim().startsWith('-')) throw new ProviderError('SEARCH_INPUT', 'Search for a film, book or artist using 2–100 characters.', { status: 422 });
     return this.cached(`search:${type}:${query.trim().toLowerCase()}`, async () => {
       const response = await this.harness.search(query.trim(), type);
@@ -129,9 +143,9 @@ export class Qloo {
       const entities = rows.map(row => normalizeEntity(row, type)).filter(entity => entity?.type === type);
       if (rows.length && !entities.length) throw new ProviderError('QLOO_CONTRACT', 'Qloo returned search matches without supported cultural entity identities.');
       this.lastVerifiedAt = this.now(); return entities.slice(0, 8);
-    });
+    }, scope);
   }
-  async research(players, onProgress = () => {}) {
+  async research(players, onProgress = () => {}, scope) {
     if (!Array.isArray(players) || players.length < 2 || players.length > 4 || players.some(p => p.favorites.length < 2 || p.favorites.length > 4 || p.favorites.some(f => !isEntityId(f.id)))) throw new ProviderError('PROFILE_INPUT', 'Each of two to four players needs two to four confirmed Qloo favourites.', { status: 422 });
     await this.harness.connect(); const tool = this.harness.tools.get('qloo_recommend');
     const exclude = new Set(players.flatMap(p => p.favorites.map(f => f.id)));
@@ -141,23 +155,25 @@ export class Qloo {
       await Promise.all(players.flatMap((player, index) => TYPES.map(type => ({ player, index, type }))).map(async ({ player, index, type }) => {
         const args = recommendationArguments(tool, player.favorites, type, limit);
         const hash = createHash('sha256').update(JSON.stringify(args)).digest('hex');
-        const entities = await this.cached(`recommend:${hash}`, async () => {
+        const snapshot = await this.cached(`recommend:${hash}`, async () => {
           if (++requested > this.maxRequests) throw new ProviderError('QLOO_BUDGET', 'This research reached its request budget. Try different favourites.', { status: 422 });
-          const rows = workflowEntities(await this.harness.call('qloo_recommend', args));
+          const response = await this.harness.call('qloo_recommend', args), rows = workflowEntities(response);
           const normalized = rows.map(row => normalizeEntity(row, type)).filter(Boolean);
           if (rows.length && !normalized.length) throw new ProviderError('QLOO_CONTRACT', 'Recommendations were returned without supported entity details.');
-          this.lastVerifiedAt = this.now(); return normalized;
-        });
+          this.lastVerifiedAt = this.now(); return { entities: normalized, receipt: { requestId: hash, category: type, inputIds: player.favorites.map(entity => entity.id), limit: args.limit ?? args.take ?? null, completedAt: this.now(), status: response.status, returnedIds: normalized.map(entity => entity.id) } };
+        }, scope);
+        const entities = snapshot.entities;
         const map = new Map(results[index].entities.map(entity => [entity.id, entity]));
-        entities.forEach(entity => { if (!exclude.has(entity.id)) map.set(entity.id, entity); });
-        results[index].entities = [...map.values()]; results[index].requests.push({ category: type, limit, completedAt: this.now() });
+        // Keep real cross-profile returns of a favourite: it may introduce that favourite to a friend.
+        entities.forEach(entity => { map.set(entity.id, entity); });
+        results[index].entities = [...map.values()]; results[index].requests.push(snapshot.receipt);
         completed++; await onProgress({ completed, total, stage: 'recommendations' });
       }));
     };
-    await runRound(12);
+    await runRound(scope?.expanded ? 20 : 12);
     const shared = results[0].entities.some(entity => results.every(result => result.entities.some(item => item.id === entity.id)));
     const properties = tool.inputSchema?.properties || {};
-    if (!shared && (properties.limit || properties.take) && this.maxRequests >= total * 2) {
+    if (!scope?.expanded && !shared && (properties.limit || properties.take) && this.maxRequests >= total * 2) {
       const bound = schemaAt(properties.limit || properties.take, tool.inputSchema).maximum;
       if (!bound || bound > 12) { total *= 2; await onProgress({ completed, total, stage: 'widening' }); await runRound(20); }
     }
@@ -174,7 +190,7 @@ export class Qloo {
           const rows = Array.isArray(raw) ? raw : raw?.entity_id ? [raw] : Array.isArray(raw?.results) ? raw.results : raw?.results?.entities;
           if (!Array.isArray(rows)) throw new ProviderError('QLOO_CONTRACT', 'Entity metadata had an unsupported response shape.');
           return rows.map(row => normalizeEntity(row)).filter(entity => entity && ids.includes(entity.id));
-        });
+        }, scope);
         const byId = new Map(metadata.map(entity => [entity.id, entity]));
         for (const result of results) result.entities = result.entities.map(entity => byId.has(entity.id) ? { ...entity, ...byId.get(entity.id), evidence: entity.evidence } : entity);
       } catch (error) {

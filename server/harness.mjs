@@ -2,9 +2,12 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ProviderError } from './errors.mjs';
+import { positiveInteger } from './limits.mjs';
 
 const ORIGIN = 'https://hackathon.api.qloo.com';
 const MAX_OUTPUT = 3 * 1024 * 1024;
+const MCP_TIMEOUT = -32001, MCP_CLOSED = -32000;
+const SAFE_TRANSPORT_CODES = new Set([-32001, -32000, -32600, -32601, -32602, -32603, -32700, 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 export function harnessEnvironment(env = process.env) {
   for (const field of ['QLOO_BASE_URL', 'QLOO_TRUSTED_BASE_URL']) {
     if (env[field] && env[field].replace(/\/$/, '') !== ORIGIN) throw new ProviderError('QLOO_HOST', `${field} must point to the hackathon API.`, { status: 503 });
@@ -68,6 +71,7 @@ export function workflowEntities(envelope) {
 export class Harness {
   constructor({ env = process.env, runner = runHarness, clientFactory } = {}) {
     this.env = harnessEnvironment(env); this.runner = runner; this.clientFactory = clientFactory;
+    this.workflowTimeout = positiveInteger(this.env.QLOO_WORKFLOW_TIMEOUT_MS ?? 60000, 'QLOO_WORKFLOW_TIMEOUT_MS', 120000);
     this.client = null; this.connecting = null; this.tools = new Map(); this.credentialReady = false;
   }
   async connect() {
@@ -107,10 +111,22 @@ export class Harness {
   }
   async call(name, args) {
     const client = await this.connect();
-    try { return unwrapTool(await client.callTool({ name, arguments: args }, undefined, { timeout: 25000 })); }
+    try { return unwrapTool(await client.callTool({ name, arguments: args }, undefined, { timeout: this.workflowTimeout, maxTotalTimeout: this.workflowTimeout })); }
     catch (error) {
       if (error instanceof ProviderError) throw error;
-      throw new ProviderError('QLOO_TRANSPORT', 'The Qloo workflow was interrupted. Your crew is saved.', { retryable: true });
+      if (this.client === client) {
+        this.client = null; this.credentialReady = false;
+        try { await client.close(); } catch {}
+      }
+      if (this.closed) throw new ProviderError('HARNESS_CLOSED', 'Research is stopping. Reconnect to the archive.');
+      const timeout = error?.code === MCP_TIMEOUT || error?.code === 'ETIMEDOUT' || ['TimeoutError', 'AbortError'].includes(error?.name);
+      const disconnected = error?.code === MCP_CLOSED || ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'].includes(error?.code);
+      const failure = new ProviderError(timeout ? 'QLOO_TIMEOUT' : disconnected ? 'QLOO_CONNECTION_CLOSED' : 'QLOO_TRANSPORT',
+        timeout ? 'The Qloo workflow exceeded its time limit. Your crew is saved; retry research shortly.'
+          : disconnected ? 'The research connection closed. Your crew is saved; retry to reconnect.'
+            : 'The Qloo workflow was interrupted. Your crew is saved; retry research shortly.', { retryable: true });
+      if (SAFE_TRANSPORT_CODES.has(error?.code)) failure.transportCode = error.code;
+      throw failure;
     }
   }
   async search(query, type) {

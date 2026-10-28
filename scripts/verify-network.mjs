@@ -7,7 +7,7 @@ import { Store } from '../server/store.mjs';
 import { startPuzzle } from '../server/game.mjs';
 import { WebSocket } from '../vendor/ws/wrapper.mjs';
 
-const oldOrigin = process.env.PUBLIC_ORIGIN; delete process.env.PUBLIC_ORIGIN;
+const oldOrigin = process.env.PUBLIC_ORIGIN, oldMode = process.env.NODE_ENV; delete process.env.PUBLIC_ORIGIN; process.env.NODE_ENV = 'test';
 // This isolated transport check supplies readiness only. Every cultural operation fails
 // immediately, so CI needs no Qloo credential and cannot accidentally spend provider quota.
 const noProvider = () => { throw new Error('Cultural requests are forbidden in the transport check.'); };
@@ -58,4 +58,4 @@ try {
   console.log('Unauthenticated WebSocket rejection: passed');
   console.log('Actual HTTP/WebSocket network verification passed. No Qloo requests were made. Browser visual QA remains separate.');
 } catch(error) {console.error(`NETWORK_CHECK: ${error.message}`);process.exitCode=1;}
-finally{for(const socket of sockets)try{socket.terminate();}catch{}realtime.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await app.close();if(oldOrigin!==undefined)process.env.PUBLIC_ORIGIN=oldOrigin;}
+finally{for(const socket of sockets)try{socket.terminate();}catch{}realtime.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await app.close();if(oldOrigin!==undefined)process.env.PUBLIC_ORIGIN=oldOrigin;if(oldMode===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=oldMode;}

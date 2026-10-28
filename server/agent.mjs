@@ -2,6 +2,12 @@
 import { createInterface } from 'node:readline';
 import { Qloo, isEntityId } from './qloo.mjs';
 import { ProviderError } from './errors.mjs';
+import { Store } from './store.mjs';
+
+function persistentResearch() {
+  const store = new Store(undefined, { recoverResearch: false });
+  return { qloo: new Qloo({ reserve: scope => store.reserveProvider(scope), outcome: success => store.providerOutcome(success) }), store };
+}
 
 export const tool = {
   name: 'research_taste_crew',
@@ -14,7 +20,7 @@ export async function researchCrew(args, suppliedQloo) {
   const profiles = args?.profiles;
   if (!Array.isArray(profiles) || profiles.length < 2 || profiles.length > 4 || profiles.some(p => typeof p.id !== 'string' || !p.id.length || p.id.length > 40 || !Array.isArray(p.entityIds) || p.entityIds.length < 2 || p.entityIds.length > 4 || new Set(p.entityIds).size !== p.entityIds.length || p.entityIds.some(id => !isEntityId(id)))) throw new ProviderError('PROFILE_INPUT', 'Provide 2–4 uniquely identified profiles, each with 2–4 confirmed Qloo UUIDs.', { status: 422 });
   if (new Set(profiles.map(p => p.id)).size !== profiles.length) throw new ProviderError('PROFILE_INPUT', 'Profile identifiers must be unique.', { status: 422 });
-  const qloo = suppliedQloo || new Qloo();
+  const owned = suppliedQloo ? null : persistentResearch(), qloo = suppliedQloo || owned.qloo;
   try {
     const results = await qloo.research(profiles.map(p => ({ id: p.id, favorites: p.entityIds.map(id => ({ id: id.toLowerCase() })) })));
     const byId = new Map();
@@ -25,7 +31,7 @@ export async function researchCrew(args, suppliedQloo) {
     return { source: 'qloo', status: 'complete', sharedCandidates: [...byId.values()].filter(entity => new Set(entity.returnedFor).size === profiles.length),
       nextAction: 'Ask each person whether every candidate is known, new or skipped. Recommendation membership does not establish novelty or individual preference.',
       maxRequestBudget: qloo.maxRequests || 24 };
-  } finally { if (!suppliedQloo) await qloo.close(); }
+  } finally { if (owned) { await qloo.close(); owned.store.close(); } }
 }
 export async function rpc(message, qloo) {
   if (message.method === 'initialize') return { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'taste-heist', version: '2.0.0' } };
@@ -39,7 +45,7 @@ export async function rpc(message, qloo) {
   throw new Error('Unknown method.');
 }
 if (process.argv[1] === import.meta.filename) {
-  const lines = createInterface({ input: process.stdin }), qloo = new Qloo();
+  const lines = createInterface({ input: process.stdin }), { qloo, store } = persistentResearch();
   try {
     for await (const line of lines) {
       let message;
@@ -49,5 +55,5 @@ if (process.argv[1] === import.meta.filename) {
         const result = await rpc(message, qloo); process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\n');
       } catch { process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message?.id ?? null, error: { code: -32600, message: 'Invalid or unsupported request.' } }) + '\n'); }
     }
-  } finally { await qloo.close(); }
+  } finally { await qloo.close(); store.close(); }
 }

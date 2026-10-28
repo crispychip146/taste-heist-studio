@@ -40,3 +40,13 @@ export function clearRoom(room, answer, now = Date.now()) {
   for (const player of room.players) command(room, player.id, { type: 'solve', answer }, now);
   for (const player of room.players) command(room, player.id, { type: 'continue' }, now);
 }
+
+export function permutations(items) {
+  return items.length ? items.flatMap((item,i) => permutations(items.filter((_,j) => j!==i)).map(rest => [item,...rest])) : [[]];
+}
+export function exitMatches(order, clues) {
+  return clues.every(clue => (!clue.first || order[0]===clue.first)
+    && clue.pairs.every(([a,b]) => order.indexOf(b)===order.indexOf(a)+1)
+    && (clue.constraints || []).every(rule => rule.relation==='before'
+      ? order.indexOf(rule.a)<order.indexOf(rule.b) : Math.abs(order.indexOf(rule.a)-order.indexOf(rule.b))===1));
+}
