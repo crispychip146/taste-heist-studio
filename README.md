@@ -2,6 +2,17 @@
 
 **Good taste. Great accomplices.** A cooperative cultural-discovery game for two to four people. Bring the films, books and artists you love, combine your private clues, and escape a miniature archive with something new to explore.
 
+## Play the live demo
+
+**[Open Taste Heist →](https://taste-heist-studio.onrender.com/)**
+
+> **First visit taking a while?** The demo runs on Render’s free hosting, which sleeps after 15 minutes without traffic. Opening the link automatically wakes it up—no intervention from the creator is needed. Render shows a loading screen during startup, which takes about a minute. Please keep the tab open while it starts.
+
+- **Play with 2–4 people.** One person creates a crew and shares the invite. Each player should use their own device or a separate browser profile; tabs in the same browser profile share one player session.
+- **Create a fresh crew for your review.** The free host clears local storage when it sleeps, restarts or redeploys, so previous crews, invitations and results may no longer be available. A new crew starts a new heist.
+
+These are [Render free-hosting limitations](https://render.com/docs/free), including the startup delay and temporary storage.
+
 <img src="public/assets/archive.webp" alt="Taste Heist’s miniature cultural archive" width="520">
 
 Taste Heist uses the official **Qloo harness** for live entity search and independent recommendations. The clay crew and puzzles are authored game fiction; the cultural discoveries come from actual provider results.
@@ -37,7 +48,7 @@ The key stays on the server. `.env` and runtime data are excluded from Git. Neve
 
 In the common-ground room, everyone sees the same available cards. Cards explain whether they are verified group matches or crew favourites, with honest familiarity counts. One action chooses and confirms a discovery; players can join an accomplice’s pick with one tap. There is no hidden recommendation puzzle to guess. Different proposals keep the room open until everyone agrees on the same item. The server then locks one canonical crew discovery. Every member receives the same downloadable dossier and actual recommendation/familiarity evidence. There are no invented compatibility percentages or novelty inferred from missing favourites.
 
-The interface includes original animated characters, sunlight and midnight themes, optional sound, keyboard controls and reduced-motion support. Theme preferences are saved. Every page load opens on the homepage, including after a server restart. **Resume saved heist** and **View last dossier** are explicit choices. Starting a new crew creates a fresh room without deleting another crew’s progress. SQLite retains identities and progress for recovery; restarting the server does not erase games. Saves from the former individual-result flow return to shared agreement with their tastes preserved.
+The interface includes original animated characters, sunlight and midnight themes, optional sound, keyboard controls and reduced-motion support. Theme preferences are saved. Every page load opens on the homepage, including after a server restart. **Resume saved heist** and **View last dossier** are explicit choices. Starting a new crew creates a fresh room without deleting another crew’s progress. SQLite retains identities and progress for recovery when its database file survives the restart; the free hosted demo has the storage limitations described above. Saves from the former individual-result flow return to shared agreement with their tastes preserved.
 
 ## How it works
 
@@ -79,7 +90,7 @@ Recommendation workflows have a 60-second deadline (`QLOO_WORKFLOW_TIMEOUT_MS`, 
 
 ## Deploy
 
-The application requires a **Node-capable VM or container** that can run the official harness and persist SQLite. `dist/` contains frontend assets only; GitHub Pages cannot host the complete game.
+The application requires a **Node-capable VM or container** that can run the official harness. Persistent storage is needed to retain SQLite games across host restarts and deployments. The free live demo uses temporary storage instead, as described above. `dist/` contains frontend assets only; GitHub Pages cannot host the complete game.
 
 ```bash
 docker build -t taste-heist .
