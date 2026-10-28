@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!server/
+!server/**
+!shared/
+!shared/**
+!public/
+!public/**
+!vendor/
+!vendor/**

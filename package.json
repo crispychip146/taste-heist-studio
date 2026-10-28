@@ -1,0 +1,28 @@
+{
+  "name": "taste-heist-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env server/index.mjs",
+    "start": "node --env-file-if-exists=.env server/index.mjs",
+    "test": "node --experimental-vm-modules --test --test-isolation=none tests/*.test.mjs",
+    "check": "node --experimental-vm-modules scripts/check.mjs",
+    "build": "node scripts/build.mjs",
+    "doctor": "node --env-file-if-exists=.env scripts/doctor.mjs",
+    "verify:live": "node --env-file-if-exists=.env scripts/verify-live.mjs",
+    "verify:network": "node --env-file-if-exists=.env scripts/verify-network.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@qloo/qloo-harness": "^0.1.26"
+  },
+  "overrides": {
+    "@earendil-works/pi-coding-agent": {
+      "undici": "8.12.2"
+    }
+  }
+}
